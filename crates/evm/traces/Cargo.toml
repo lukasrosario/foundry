@@ -22,6 +22,7 @@ alloy-json-abi.workspace = true
 alloy-primitives = { workspace = true, features = ["serde", "getrandom", "arbitrary", "rlp"] }
 alloy-sol-types.workspace = true
 revm-inspectors.workspace = true
+revm-precompile.workspace = true
 
 eyre = "0.6"
 futures = "0.3"
@@ -37,3 +38,15 @@ yansi = "0.5"
 
 [dev-dependencies]
 tempfile = "3"
+
+[patch.crates-io]
+revm = { path = "../../bluealloy/revm/crates/revm" }
+revm-primitives = { path = "../../bluealloy/revm/crates/primitives" }
+revm-interpreter = { path = "../../bluealloy/revm/crates/interpreter" }
+revm-precompile = { path = "../../bluealloy/revm/crates/precompile" }
+
+[patch.'https://github.com/bluealloy/revm']
+revm = { path = "../../bluealloy/revm/crates/revm" }
+revm-primitives = { path = "../../bluealloy/revm/crates/primitives" }
+revm-interpreter = { path = "../../bluealloy/revm/crates/interpreter" }
+revm-precompile = { path = "../../bluealloy/revm/crates/precompile" }

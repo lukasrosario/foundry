@@ -36,6 +36,7 @@ revm = { workspace = true, default-features = false, features = [
     "arbitrary",
 ] }
 revm-inspectors.workspace = true
+revm-precompile.workspace = true
 
 ethers-signers.workspace = true
 itertools.workspace = true

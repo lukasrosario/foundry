@@ -79,6 +79,7 @@ pub fn to_precompile_id(spec_id: SpecId) -> revm::precompile::SpecId {
         SpecId::MERGE |
         SpecId::SHANGHAI |
         SpecId::CANCUN |
+        SpecId::FJORD |
         SpecId::BEDROCK |
         SpecId::REGOLITH |
         SpecId::CANYON |

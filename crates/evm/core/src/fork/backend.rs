@@ -180,7 +180,7 @@ where
                 let block_id = self.block_id;
                 let fut = Box::pin(async move {
                     // serialize & deserialize back to U256
-                    let idx_req = B256::from(idx);
+                    let idx_req = U256::from(idx);
                     let storage = provider.get_storage_at(address, idx_req, block_id).await;
                     (storage.wrap_err("could not fetch slot {idx} from {address}"), address, idx)
                 });

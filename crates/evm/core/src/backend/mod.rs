@@ -1735,6 +1735,7 @@ impl BackendInner {
                 SpecId::ISTANBUL => revm::primitives::ISTANBUL,
                 SpecId::BERLIN => revm::primitives::BERLIN,
                 SpecId::CANCUN => revm::primitives::CANCUN,
+                SpecId::FJORD => revm::primitives::FJORD,
                 // Point latest to berlin for now, as we don't wanna accidentally point to Cancun.
                 SpecId::LATEST => revm::primitives::BERLIN,
             }

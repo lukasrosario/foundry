@@ -8,7 +8,7 @@ use foundry_compilers::{
     remappings::{Remapping, RemappingError},
     EvmVersion,
 };
-use revm_primitives::SpecId;
+use revm_primitives::{SpecId, Spec};
 use serde::{de::Error, Deserialize, Deserializer};
 use std::{
     path::{Path, PathBuf},
@@ -309,6 +309,7 @@ pub fn evm_spec_id(evm_version: &EvmVersion) -> SpecId {
         EvmVersion::London => SpecId::LONDON,
         EvmVersion::Paris => SpecId::MERGE,
         EvmVersion::Shanghai => SpecId::SHANGHAI,
+        EvmVersion::Fjord => SpecId::FJORD,
     }
 }
 

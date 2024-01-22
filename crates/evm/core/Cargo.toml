@@ -36,6 +36,7 @@ revm = { workspace = true, default-features = false, features = [
     "optimism",
 ] }
 revm-inspectors.workspace = true
+revm-precompile.workspace = true
 
 ethers-core.workspace = true
 ethers-providers.workspace = true
