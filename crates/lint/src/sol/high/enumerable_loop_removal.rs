@@ -78,11 +78,12 @@ impl<'hir> LoopFinder<'_, '_, '_, 'hir> {
         // which runs once, on the straight line entering the loop.
         if let StmtKind::Block(block) = &stmt.kind
             && let Some(last) = block.stmts.last()
-            && let StmtKind::Loop(body, LoopSource::For) = &last.kind
+            && let StmtKind::Loop(body, source @ (LoopSource::For | LoopSource::ForWithUpdate)) =
+                &last.kind
         {
             let init = &block.stmts[..block.stmts.len() - 1];
             self.walk_body(init);
-            self.enter_loop(init, body.stmts, LoopSource::For);
+            self.enter_loop(init, body.stmts, *source);
             return;
         }
         match &stmt.kind {
@@ -237,14 +238,13 @@ impl<'hir> LoopFinder<'_, '_, '_, 'hir> {
 /// that does not match the exact synthetic shape is returned unchanged.
 const fn real_body<'hir>(source: LoopSource, body: &'hir [Stmt<'hir>]) -> &'hir [Stmt<'hir>] {
     match source {
-        LoopSource::For | LoopSource::While => {
+        LoopSource::For | LoopSource::ForWithUpdate | LoopSource::While => {
             if let [only] = body
                 && let StmtKind::If(_, then, Some(else_)) = &only.kind
                 && matches!(else_.kind, StmtKind::Break)
             {
                 return std::slice::from_ref(*then);
             }
-            body
         }
         LoopSource::DoWhile => {
             if let Some((last, rest)) = body.split_last()
@@ -254,9 +254,9 @@ const fn real_body<'hir>(source: LoopSource, body: &'hir [Stmt<'hir>]) -> &'hir 
             {
                 return rest;
             }
-            body
         }
     }
+    body
 }
 
 /// Whether every statement of a loop body runs on one straight line: no branch (`if`/`try`), no

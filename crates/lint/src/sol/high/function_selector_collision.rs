@@ -17,7 +17,7 @@ use solar::{
             self, BinOpKind, CallArgs, ContractId, ContractKind, Expr, ExprKind, ItemId, Stmt,
             StmtKind, TypeKind, Visit,
         },
-        ty::{ResolvedMember, Ty, TyKind},
+        ty::{Ty, TyKind},
     },
 };
 use std::{
@@ -536,7 +536,7 @@ impl<'hir> DelegateTargetCollector<'hir> {
             }
 
             self.paths = std::mem::take(&mut pending);
-            let next = if source == hir::LoopSource::For
+            let next = if source == hir::LoopSource::ForWithUpdate
                 && let Some((next, for_exits)) = self.visit_for_iteration(block)
             {
                 Self::extend_unique(&mut exits, for_exits);
@@ -798,14 +798,11 @@ fn is_msg_sig(expr: &Expr<'_>) -> bool {
 fn selected_function_selector(gcx: Gcx<'_>, expr: &Expr<'_>) -> Option<Selector> {
     let expr = expr.peel_parens();
     let ExprKind::Member(function, member) = &expr.kind else { return None };
-    if member.name != sym::selector
-        || gcx.builtin_member(expr.id) != Some(Builtin::FunctionSelector)
+    if member.name != sym::selector || gcx.resolved_builtin(expr) != Some(Builtin::FunctionSelector)
     {
         return None;
     }
-    let ResolvedMember::Res(hir::Res::Item(ItemId::Function(function))) =
-        gcx.resolved_member(function.peel_parens().id)?
-    else {
+    let hir::Res::Item(ItemId::Function(function)) = gcx.resolved_expr(function)? else {
         return None;
     };
     Some(gcx.function_selector(function))
@@ -821,7 +818,7 @@ fn delegated_contract<'hir>(
     let ExprKind::Member(receiver, member) = &callee.peel_parens().kind else { return None };
     let required_input = forwards_full_calldata(args, full_calldata_inputs)?;
     if member.name != kw::Delegatecall
-        || gcx.builtin_callee(callee.id) != Some(Builtin::AddressDelegatecall)
+        || gcx.resolved_builtin(callee) != Some(Builtin::AddressDelegatecall)
         || !gcx.type_of_expr(receiver.peel_parens().id).is_some_and(ty_is_address)
     {
         return None;

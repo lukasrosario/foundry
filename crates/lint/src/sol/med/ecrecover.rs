@@ -13,7 +13,7 @@ use solar::{
     sema::{
         Gcx,
         builtins::Builtin,
-        eval::{ConstValue, ConstantEvaluator},
+        eval::ConstValue,
         hir::{
             self, ExprKind, ItemId, LoopSource, Res, StateMutability, StmtKind, TypeKind, Visit,
         },
@@ -384,7 +384,7 @@ impl<'hir> Analyzer<'hir> {
         {
             return args.exprs().next().and_then(|arg| self.const_value(arg));
         }
-        if self.gcx.builtin_member(expr.peel_parens().id) == Some(Builtin::TypeMax)
+        if self.gcx.resolved_builtin(expr) == Some(Builtin::TypeMax)
             && let Some(ty) = self.gcx.type_of_expr(expr.peel_parens().id)
             && let TyKind::Elementary(ElementaryType::UInt(size)) = ty.kind
         {
@@ -402,9 +402,7 @@ impl<'hir> Analyzer<'hir> {
                 _ => unreachable!(),
             };
         }
-        if let Some(value) =
-            ConstantEvaluator::new(self.gcx).try_eval(expr).ok().and_then(|value| value.as_u256())
-        {
+        if let Some(value) = self.gcx.try_eval_const(expr).ok().and_then(|value| value.as_u256()) {
             return Some(value);
         }
         None
@@ -561,7 +559,7 @@ impl<'hir> Analyzer<'hir> {
         }) else {
             return;
         };
-        if matches!(source, LoopSource::For)
+        if matches!(source, LoopSource::ForWithUpdate)
             && let Some(next) = for_loop_next_expr(block)
         {
             self.add_expr_effects(next, &mut effects);
@@ -1383,8 +1381,8 @@ fn call_may_mutate_state(gcx: Gcx<'_>, hir: &hir::Hir<'_>, callee: &hir::Expr<'_
 }
 
 fn constant_bool(gcx: Gcx<'_>, expr: &hir::Expr<'_>) -> Option<bool> {
-    match ConstantEvaluator::new(gcx).try_eval_value(expr).ok()? {
-        ConstValue::Bool(value) => Some(value),
+    match gcx.try_eval_const_value(expr).ok()? {
+        ConstValue::Bool(value) => Some(*value),
         _ => None,
     }
 }

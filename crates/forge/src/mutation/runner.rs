@@ -21,12 +21,16 @@ use eyre::Result;
 use foundry_common::{compile::ProjectCompiler, sh_eprintln, sh_println};
 use foundry_compilers::compilers::multi::MultiCompiler;
 use foundry_config::{Config, InlineConfig};
+#[cfg(feature = "monad")]
+use foundry_evm::core::evm::MonadEvmNetwork;
 #[cfg(feature = "optimism")]
 use foundry_evm::core::evm::OpEvmNetwork;
 use foundry_evm::{
     core::evm::{
         BlockEnvFor, EthEvmNetwork, FoundryEvmNetwork, SpecFor, TempoEvmNetwork, TxEnvFor,
     },
+    executors::ExecutorBuilder,
+    fork::ResolvedFork,
     opts::EvmOpts,
 };
 use rayon::prelude::*;
@@ -56,6 +60,14 @@ pub struct MutantTestResult {
 pub struct MutationBatchResult {
     pub results: Vec<MutantTestResult>,
     pub cancelled: bool,
+}
+
+/// Immutable EVM inputs shared by the baseline and every mutation worker.
+#[derive(Clone)]
+pub struct MutationEvmConfig {
+    pub opts: EvmOpts,
+    pub resolved_fork: Option<ResolvedFork>,
+    pub create2_deployer_available: bool,
 }
 
 /// Tracks progress and adaptive span skipping across parallel workers.
@@ -170,7 +182,7 @@ pub fn run_mutations_parallel_with_progress(
     source_path: PathBuf,
     original_source: Arc<String>,
     config: Arc<Config>,
-    evm_opts: EvmOpts,
+    evm: MutationEvmConfig,
     num_workers: usize,
     progress: Option<MutationProgress>,
     silent: bool,
@@ -259,7 +271,7 @@ pub fn run_mutations_parallel_with_progress(
                     &source_relative,
                     &original_source,
                     &config,
-                    &evm_opts,
+                    &evm,
                     &shared_state,
                     &temp_root,
                     &filter_args,
@@ -338,7 +350,7 @@ fn test_single_mutant_isolated(
     source_relative: &PathBuf,
     original_source: &Arc<String>,
     config: &Arc<Config>,
-    evm_opts: &EvmOpts,
+    evm: &MutationEvmConfig,
     shared_state: &Arc<SharedMutationState>,
     temp_root: &Path,
     filter_args: &Arc<FilterArgs>,
@@ -416,7 +428,7 @@ fn test_single_mutant_isolated(
     let result = match timeout {
         Some(budget) => run_compile_and_test_with_timeout(
             temp_config,
-            evm_opts,
+            evm,
             budget,
             temp_dir,
             shared_state,
@@ -428,7 +440,7 @@ fn test_single_mutant_isolated(
         None => {
             let res = match compile_and_test(
                 &temp_config,
-                evm_opts,
+                evm,
                 filter_args,
                 rerun_failures.as_ref().as_deref(),
                 selected_sources_relative,
@@ -468,7 +480,7 @@ fn test_single_mutant_isolated(
 #[allow(clippy::too_many_arguments)]
 fn run_compile_and_test_with_timeout(
     config: Arc<Config>,
-    evm_opts: &EvmOpts,
+    evm: &MutationEvmConfig,
     budget: Duration,
     temp_dir: TempDir,
     shared_state: &Arc<SharedMutationState>,
@@ -478,7 +490,7 @@ fn run_compile_and_test_with_timeout(
     isolate: bool,
 ) -> MutationResult {
     let (tx, rx) = mpsc::channel::<Result<bool>>();
-    let opts = evm_opts.clone();
+    let evm = evm.clone();
     // Move `temp_dir` into the worker so its `Drop` only runs after the worker
     // thread exits. Do NOT capture by reference — the worker may outlive this
     // function on timeout.
@@ -494,7 +506,7 @@ fn run_compile_and_test_with_timeout(
             let res = panic::catch_unwind(AssertUnwindSafe(|| {
                 compile_and_test(
                     &cfg,
-                    &opts,
+                    &evm,
                     &filter_for_worker,
                     rerun_for_worker.as_ref().as_deref(),
                     &selected_sources_for_worker,
@@ -609,52 +621,82 @@ fn temp_config_for_mutation(config: &Config, temp_path: &Path) -> Config {
 /// Dispatches to the correct network type based on `evm_opts.networks`.
 fn compile_and_test(
     config: &Arc<Config>,
-    evm_opts: &EvmOpts,
+    evm: &MutationEvmConfig,
     filter_args: &FilterArgs,
     rerun_failures: Option<&[RerunFailure]>,
     selected_sources_relative: &[PathBuf],
     isolate: bool,
 ) -> Result<bool> {
-    if evm_opts.networks.is_tempo() {
+    if evm.opts.networks.is_tempo() {
         compile_and_test_inner::<TempoEvmNetwork>(
             config,
-            evm_opts,
+            evm,
             filter_args,
             rerun_failures,
             selected_sources_relative,
             isolate,
+            ExecutorBuilder::<TempoEvmNetwork>::new(),
         )
     } else {
-        #[cfg(feature = "optimism")]
-        if evm_opts.networks.is_optimism() {
-            return compile_and_test_inner::<OpEvmNetwork>(
+        #[cfg(feature = "base")]
+        if evm.opts.networks.is_base() {
+            return compile_and_test_inner::<foundry_evm::core::evm::BaseEvmNetwork>(
                 config,
-                evm_opts,
+                evm,
                 filter_args,
                 rerun_failures,
                 selected_sources_relative,
                 isolate,
+                ExecutorBuilder::<foundry_evm::core::evm::BaseEvmNetwork>::new(),
+            );
+        }
+        #[cfg(feature = "monad")]
+        if evm.opts.networks.is_monad() {
+            return compile_and_test_inner::<MonadEvmNetwork>(
+                config,
+                evm,
+                filter_args,
+                rerun_failures,
+                selected_sources_relative,
+                isolate,
+                ExecutorBuilder::<MonadEvmNetwork>::new(),
+            );
+        }
+        #[cfg(feature = "optimism")]
+        if evm.opts.networks.is_optimism() {
+            return compile_and_test_inner::<OpEvmNetwork>(
+                config,
+                evm,
+                filter_args,
+                rerun_failures,
+                selected_sources_relative,
+                isolate,
+                ExecutorBuilder::<OpEvmNetwork>::new(),
             );
         }
         compile_and_test_inner::<EthEvmNetwork>(
             config,
-            evm_opts,
+            evm,
             filter_args,
             rerun_failures,
             selected_sources_relative,
             isolate,
+            ExecutorBuilder::<EthEvmNetwork>::new(),
         )
     }
 }
 
 fn compile_and_test_inner<FEN: FoundryEvmNetwork>(
     config: &Arc<Config>,
-    evm_opts: &EvmOpts,
+    evm: &MutationEvmConfig,
     filter_args: &FilterArgs,
     rerun_failures: Option<&[RerunFailure]>,
     selected_sources_relative: &[PathBuf],
     isolate: bool,
+    executor_builder: ExecutorBuilder<FEN>,
 ) -> Result<bool> {
+    let evm_opts = &evm.opts;
+    let resolved_fork = evm.resolved_fork.as_ref();
     // Compile
     let files = selected_sources_relative
         .iter()
@@ -688,8 +730,12 @@ fn compile_and_test_inner<FEN: FoundryEvmNetwork>(
 
     // Use block_on to run within the runtime context
     let results: BTreeMap<String, SuiteResult> = rt.block_on(async {
-        let (evm_env, tx_env, fork_block) =
-            evm_opts.env::<SpecFor<FEN>, BlockEnvFor<FEN>, TxEnvFor<FEN>>().await?;
+        let (evm_env, tx_env) = evm_opts
+            .env_with_resolved_fork::<SpecFor<FEN>, BlockEnvFor<FEN>, TxEnvFor<FEN>>(resolved_fork)
+            .await?;
+        let fork_context = resolved_fork.map(ResolvedFork::context);
+        let fork_chain_id = fork_context.map(|context| context.source_chain_id);
+        let fork_hardfork = fork_context.and_then(|context| context.hardfork);
 
         // Build test runner mirroring the canonical `forge test` runner: same
         // isolation flag, same fail-fast semantics for mutation, and same
@@ -699,10 +745,19 @@ fn compile_and_test_inner<FEN: FoundryEvmNetwork>(
             .set_debug(false)
             .initial_balance(evm_opts.initial_balance)
             .sender(evm_opts.sender)
-            .with_fork(evm_opts.get_fork(config, evm_env.cfg_env.chain_id, fork_block))
+            .with_fork(evm_opts.get_fork_resolved(config, evm_env.cfg_env.chain_id, resolved_fork))
+            .with_fork_chain_id(fork_chain_id)
+            .with_fork_hardfork(fork_hardfork)
             .enable_isolation(isolate)
             .fail_fast(true)
-            .build::<FEN, MultiCompiler>(&compile_output, evm_env, tx_env, evm_opts.clone())?;
+            .with_create2_deployer_available(evm.create2_deployer_available)
+            .build::<FEN, MultiCompiler>(
+                &compile_output,
+                evm_env,
+                tx_env,
+                evm_opts.clone(),
+                executor_builder,
+            )?;
 
         runner.test_collect(&filter)
     })?;

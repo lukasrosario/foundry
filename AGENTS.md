@@ -12,9 +12,10 @@ written in Rust.
 - `anvil`: local Ethereum development node
 - `chisel`: Solidity REPL
 
-The repository is a Cargo workspace. Core crates live under `crates/`, docs for
-contributors live under `docs/dev/`, and Solidity fixtures and integration test
-projects live under `testdata/`.
+The repository is a Cargo workspace. Core crates live under `crates/`, Solidity
+fixtures and integration test projects live under `testdata/`, and the
+[developer documentation](docs/dev/README.md) defines documentation ownership
+and indexes maintained cross-crate guides.
 
 ## Commands
 
@@ -46,8 +47,8 @@ Rust formatting uses nightly.
 
 Foundry's EVM execution tooling is built around `revm`. Cheatcodes are calls to
 the fixed cheatcode address and are dispatched through the cheatcode inspector.
-Custom network behavior for `anvil`, `forge`, and `cast` is implemented through
-the EVM networks crate.
+For custom network work, follow the ownership, state-lifecycle, tool-dispatch,
+and CI checklist in [`docs/dev/networks.md`](docs/dev/networks.md).
 
 For symbolic execution work under `crates/evm/symbolic`, read
 `crates/evm/symbolic/AGENTS.md` before editing.
@@ -93,25 +94,9 @@ replays persisted corpus entries and writes AFL `showmap`-style coverage files.
 
 ## CLI Output
 
-Foundry CLIs follow a stdout/stderr contract:
-
-- stdout is the command's machine-readable primary result
-- stderr is for warnings, errors, progress, status text, prompts, and banners
-- `--json` changes stdout format, not channel cleanliness
-- `--quiet` suppresses diagnostics and progress, not the command result
-- verbosity flags such as `-vvv` must not change stdout content
-
-Use the `sh_*` macros from `foundry_common::io`:
-
-- `sh_println!` / `sh_print!`: primary stdout result only
-- `sh_status!`: status prose on stderr
-- `sh_progress!`: progress on stderr
-- `sh_warn!`: recoverable warnings on stderr
-- `sh_err!`: errors on stderr
-- `prompt!`: prompt on stderr and read from stdin
-
-Do not use `println!`, `print!`, `eprintln!`, or `eprint!`; workspace clippy
-configuration forbids them.
+Follow [`docs/dev/output-channels.md`](docs/dev/output-channels.md), the canonical
+stdout/stderr contract. Use the `foundry_common::io` `sh_*` and `prompt!` macros;
+workspace Clippy configuration forbids direct `std::print*` and `std::eprint*`.
 
 ## Configuration
 
@@ -178,6 +163,31 @@ not include validation/testing boilerplate such as "Validated with", "Tested
 with", or command lists unless explicitly requested. Do not use templates,
 bullet lists, or long essays. When writing PR bodies from scripts, use a file or
 heredoc with real newlines; never pass escaped `\n` sequences.
+
+### Changelog Entries
+
+Every pull request must add or update at least one `.changelog/*.md` entry unless
+a maintainer applies the `L-ignore` label. Add an entry by default; when a change
+should not appear in release notes, such as a CI-only or repository-maintenance
+change, call out that a maintainer must apply `L-ignore`.
+
+Use a descriptive, unique filename and the format documented in
+`.changelog/README.md`:
+
+```md
+---
+forge: minor
+cast: patch
+---
+
+Added a Forge feature and fixed the related Cast behavior.
+```
+
+List every affected publishable workspace package by its actual Cargo package
+name and assign each a `major`, `minor`, or `patch` bump. Include a concise,
+non-empty user-facing release note. Do not use unknown or aggregate package
+names, leave the package mapping or note empty, or satisfy the requirement only
+by deleting an existing entry.
 
 ### Performance PRs
 

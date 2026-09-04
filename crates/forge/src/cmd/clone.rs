@@ -19,7 +19,7 @@ use foundry_compilers::{
     ProjectCompileOutput, ProjectPathsConfig,
     artifacts::{
         ConfigurableContractArtifact, Settings, StorageLayout,
-        output_selection::ContractOutputSelection,
+        output_selection::{ContractOutputSelection, OutputSelection},
         remappings::{RelativeRemapping, Remapping},
     },
     compilers::solc::Solc,
@@ -670,6 +670,9 @@ fn dump_sources(meta: &Metadata, root: &PathBuf, no_reorg: bool) -> Result<Vec<R
 fn ensure_source_entrypoint(root: &Path) -> Result<()> {
     let src = root.join("src");
     let has_src_sources = fs::files_with_ext(&src, "sol").next().is_some();
+    if has_src_sources {
+        return Ok(());
+    }
     let forge_std = root.join("lib/forge-std");
     let mut sources = fs::files_with_ext(root, "sol")
         .filter(|path| !path.starts_with(&src) && !path.starts_with(&forge_std))
@@ -712,7 +715,11 @@ fn source_import(root: &Path, index: usize, path: &Path) -> Result<String> {
 pub fn compile_project(root: &Path) -> Result<ProjectCompileOutput> {
     let mut config = Config::load_with_root(root)?.sanitized();
     config.extra_output.push(ContractOutputSelection::StorageLayout);
-    let project = config.project()?;
+    let mut project = config.project()?;
+    project.no_artifacts = true;
+    project.update_output_selection(|selection| {
+        *selection = OutputSelection::common_output_selection(["storageLayout".to_string()]);
+    });
     let compiler = ProjectCompiler::new();
     compiler.compile(&project)
 }
@@ -1094,7 +1101,8 @@ mod tests {
     #[expect(clippy::disallowed_macros)]
     fn assert_successful_compilation(root: &PathBuf) -> ProjectCompileOutput {
         println!("project_root: {root:#?}");
-        compile_project(root).expect("compilation failure")
+        let config = Config::load_with_root(root).unwrap().sanitized();
+        ProjectCompiler::new().compile(&config.project().unwrap()).expect("compilation failure")
     }
 
     fn assert_compilation_result(
@@ -1271,7 +1279,6 @@ mod tests {
         std::fs::create_dir_all(&library).unwrap();
         std::fs::create_dir_all(&other_library).unwrap();
         std::fs::create_dir_all(&forge_std).unwrap();
-        std::fs::write(src.join("Unrelated.sol"), "contract Unrelated {}").unwrap();
         std::fs::write(library.join("AToken.sol"), "contract AToken {}").unwrap();
         std::fs::write(library.join("Helper.sol"), "contract Helper {}").unwrap();
         std::fs::write(other_library.join("Helper.sol"), "contract Helper {}").unwrap();
@@ -1290,7 +1297,26 @@ mod tests {
              import * as CloneSource1 from \"../lib/dependency/src/Helper.sol\";\n\
              import * as CloneSource2 from \"../lib/other/src/Helper.sol\";\n"
         );
-        compile_project(temp.path()).unwrap();
+        let output = compile_project(temp.path()).unwrap();
+        let (_, artifact) = find_main_contract(&output, "AToken").unwrap();
+        assert!(artifact.storage_layout.is_some());
+        assert!(artifact.bytecode.is_none());
+        assert!(!temp.path().join("out").exists());
+    }
+
+    #[test]
+    fn test_does_not_add_entrypoint_when_src_has_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        let library = temp.path().join("lib/dependency/src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(src.join("Contract.sol"), "contract Contract {}").unwrap();
+        std::fs::write(library.join("Dependency.sol"), "contract Dependency {}").unwrap();
+
+        ensure_source_entrypoint(temp.path()).unwrap();
+
+        assert!(!src.join("Clone.sol").exists());
     }
 
     #[test]

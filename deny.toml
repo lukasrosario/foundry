@@ -7,6 +7,9 @@ yanked = "warn"
 ignore = [
     # https://rustsec.org/advisories/RUSTSEC-2024-0436 paste! is unmaintained
     "RUSTSEC-2024-0436",
+    # https://rustsec.org/advisories/RUSTSEC-2025-0172 zip-extract is unmaintained.
+    # No fixed soldeer release is available yet.
+    "RUSTSEC-2025-0172",
     # https://rustsec.org/advisories/RUSTSEC-2026-0173 proc-macro-error2 is unmaintained
     "RUSTSEC-2026-0173",
     # https://rustsec.org/advisories/RUSTSEC-2026-0194 quick-xml duplicate
@@ -16,6 +19,9 @@ ignore = [
     # declaration handling can allocate without a bound. No fixed quick-junit,
     # inferno, or soldeer release is available for either advisory yet.
     "RUSTSEC-2026-0195",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0247 bitmaps is unmaintained.
+    # No fixed imbl release is available yet: https://github.com/jneem/imbl/issues/170
+    "RUSTSEC-2026-0247",
 ]
 
 # This section is considered when running `cargo deny check bans`.
@@ -111,6 +117,8 @@ allow-git = [
     # Tempo
     "https://github.com/tempoxyz/tempo",
     "https://github.com/tempoxyz/mpp-rs",
+    # Base
+    "https://github.com/base/base",
     # Transitive dependency of Tempo
     "https://github.com/commonwarexyz/monorepo",
     "https://github.com/paradigmxyz/reth",

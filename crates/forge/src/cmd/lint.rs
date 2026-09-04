@@ -1,3 +1,4 @@
+use super::install;
 use clap::{Parser, ValueHint};
 use eyre::{Result, eyre};
 use forge_lint::{
@@ -10,7 +11,11 @@ use foundry_cli::{
 };
 use foundry_common::shell;
 use foundry_compilers::{FileFilter, solc::SolcLanguage, utils::SOLC_EXTENSIONS};
-use foundry_config::{SkipBuildFilters, filter::expand_globs, lint::Severity};
+use foundry_config::{
+    SkipBuildFilters,
+    filter::{expand_globs, is_ignored_path},
+    lint::Severity,
+};
 use std::path::PathBuf;
 
 /// CLI arguments for `forge lint`.
@@ -38,9 +43,16 @@ pub struct LintArgs {
 foundry_config::impl_figment_convert!(LintArgs, build);
 
 impl LintArgs {
-    pub fn run(self) -> Result<()> {
+    pub async fn run(self) -> Result<()> {
         let format_json = shell::is_json();
-        let config = self.load_config()?;
+        let mut config = self.load_config()?;
+
+        if install::install_missing_dependencies(&mut config).await && config.auto_detect_remappings
+        {
+            // Need to re-configure here to also catch additional remappings.
+            config = self.load_config()?;
+        }
+
         let project = config.ephemeral_project()?;
         let path_config = config.project_paths();
 
@@ -57,7 +69,7 @@ impl LintArgs {
                 config
                     .project_paths::<SolcLanguage>()
                     .input_files_iter()
-                    .filter(|p| !(ignored.contains(p) || ignored.contains(&cwd.join(p))))
+                    .filter(|p| !is_ignored_path(p, &ignored, &cwd))
                     .collect()
             }
             paths => {
@@ -112,7 +124,6 @@ impl LintArgs {
             .with_lint_specific(&config.lint.lint_specific);
 
         let mut opts = solar::interface::config::CompileOpts::default();
-        opts.unstable.typeck = true;
         if format_json {
             opts.error_format = solar::interface::config::ErrorFormat::RustcJson;
         }
@@ -121,9 +132,12 @@ impl LintArgs {
             if format_json { session.build() } else { session.with_stderr_emitter().build() };
         if format_json {
             let writer = Box::new(std::io::BufWriter::new(std::io::stdout()));
-            let emitter =
-                solar::interface::diagnostics::JsonEmitter::new(writer, session.clone_source_map())
-                    .rustc_like(true);
+            let emitter = solar::interface::diagnostics::JsonEmitter::new(
+                writer,
+                session.clone_source_map(),
+                solar::interface::ColorChoice::Never,
+            )
+            .rustc_like(true);
             session.dcx.set_emitter(Box::new(emitter));
         }
         let mut compiler = solar::sema::Compiler::new(session);

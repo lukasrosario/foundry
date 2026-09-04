@@ -86,17 +86,32 @@ const SYMBOLIC_KEYS: &[&str] = &[
 /// Allowed keys for TracingConfig.
 /// Required because empty labels and optional trace depth are skipped by default serialization,
 /// but they are still valid user-facing config keys.
-const TRACING_KEYS: &[&str] =
-    &["verbosity", "labels", "disable_labels", "compact_labels", "trace_depth", "decode_internal"];
+const TRACING_KEYS: &[&str] = &[
+    "verbosity",
+    "labels",
+    "disable_labels",
+    "compact_labels",
+    "trace_depth",
+    "decode_internal",
+    "external_identification_timeout",
+];
 
 /// Reserved keys that should not trigger unknown key warnings.
 const RESERVED_KEYS: &[&str] = &["extends"];
 
 /// Keys kept for backward compatibility that should not trigger unknown key warnings.
 ///
-/// `tempo` and `optimism` are legacy aliases for `network = "tempo"` / `network = "optimism"` —
-/// still accepted on input but no longer serialized in the default config.
-const BACKWARD_COMPATIBLE_KEYS: &[&str] = &["solc_version", "tempo", "optimism"];
+/// Network flags are legacy aliases for canonical `network = "..."` values. They remain accepted
+/// when the corresponding network support is compiled, but are no longer serialized.
+const BACKWARD_COMPATIBLE_KEYS: &[&str] = &[
+    "solc_version",
+    "tempo",
+    "optimism",
+    #[cfg(feature = "monad")]
+    "monad",
+    #[cfg(feature = "base")]
+    "base",
+];
 
 const LABELS_KEY: &str = "labels";
 const TRACING_LABELS_KEY: &str = "tracing.labels";

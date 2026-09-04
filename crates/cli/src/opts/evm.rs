@@ -3,7 +3,7 @@
 use alloy_primitives::{Address, B256, U256};
 use clap::Parser;
 use foundry_config::{
-    Chain, Config,
+    Chain, Config, FoundryHardfork,
     figment::{
         self, Metadata, Profile, Provider,
         error::Kind::InvalidType,
@@ -125,6 +125,13 @@ pub struct EvmArgs {
     #[serde(skip)]
     pub no_isolate: bool,
 
+    /// The runtime EVM hardfork to use.
+    ///
+    /// Network-specific hardforks must be namespaced, for example `tempo:T5`.
+    #[arg(long, value_name = "HARDFORK")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardfork: Option<FoundryHardfork>,
+
     /// Network selection.
     #[command(flatten)]
     #[serde(skip)]
@@ -186,8 +193,8 @@ impl Provider for EvmArgs {
 
         // Only insert network flags when explicitly set via CLI to avoid overriding
         // values from foundry.toml (NetworkConfigs is flattened in Config).
-        if let Some(name) = self.networks.active_network_name() {
-            dict.insert("network".to_string(), name.into());
+        if let Some(network) = self.networks.resolved_network() {
+            dict.insert("network".to_string(), network.name().into());
         }
         if self.networks.is_celo() {
             dict.insert("celo".to_string(), true.into());
@@ -316,6 +323,26 @@ mod tests {
     }
 
     #[test]
+    fn celo_network_is_included_in_provider_data() {
+        let args = EvmArgs { networks: NetworkConfigs::with_celo(), ..Default::default() };
+        let data = args.data().expect("provider data");
+        let dict = data.get(&Config::selected_profile()).expect("profile dict");
+
+        assert_eq!(dict.get("celo"), Some(&Value::from(true)));
+        assert!(!dict.contains_key("network"));
+    }
+
+    #[test]
+    fn explicit_ethereum_network_is_included_in_provider_data() {
+        let args = EvmArgs { networks: NetworkConfigs::with_ethereum(), ..Default::default() };
+        let data = args.data().expect("provider data");
+        let dict = data.get(&Config::selected_profile()).expect("profile dict");
+
+        assert_eq!(dict.get("network"), Some(&Value::from("ethereum")));
+        assert!(!dict.contains_key("celo"));
+    }
+
+    #[test]
     fn rpc_url_arg_does_not_read_eth_rpc_url_env() {
         use clap::CommandFactory;
 
@@ -337,6 +364,28 @@ mod tests {
 
         let env = EnvArgs::parse_from(["foundry-cli", "--chain-id", "goerli"]);
         assert_eq!(env.chain, Some(NamedChain::Goerli.into()));
+    }
+
+    #[cfg(feature = "base")]
+    #[test]
+    fn can_parse_namespaced_base_hardfork() {
+        let args = EvmArgs::parse_from(["foundry-cli", "--hardfork", "base:Beryl"]);
+        assert_eq!(args.hardfork.map(String::from).as_deref(), Some("base:Beryl"));
+
+        let config = Config::from_provider(Config::figment().merge(args)).unwrap();
+        assert!(config.networks.is_base());
+        assert_eq!(config.hardfork.map(String::from).as_deref(), Some("base:Beryl"));
+    }
+
+    #[test]
+    fn hardfork_arg_selects_network() {
+        let args = EvmArgs::parse_from(["foundry-cli", "--hardfork", "tempo:T5"]);
+        let hardfork = "tempo:T5".parse::<FoundryHardfork>().unwrap();
+        assert_eq!(args.hardfork, Some(hardfork));
+
+        let config = Config::from_provider(Config::figment().merge(args)).unwrap();
+        assert_eq!(config.hardfork, Some(hardfork));
+        assert!(config.networks.is_tempo());
     }
 
     #[test]

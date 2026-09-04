@@ -1,3 +1,5 @@
+#[cfg(feature = "base")]
+use crate::cmd::resolve_network;
 use crate::{
     Cast, SimpleCast,
     cmd::erc20::IERC20,
@@ -5,13 +7,16 @@ use crate::{
     traces::identifier::SignaturesIdentifier,
     tx::CastTxSender,
 };
+use alloy_consensus::Typed2718;
 use alloy_dyn_abi::{ErrorExt, EventExt};
-use alloy_eips::eip7702::SignedAuthorization;
+use alloy_eips::{Encodable2718, eip7702::SignedAuthorization};
 use alloy_ens::{ProviderEnsExt, namehash};
 use alloy_network::{Ethereum, eip2718::Decodable2718};
 use alloy_primitives::{Address, B256, eip191_hash_message, hex, keccak256};
 use alloy_provider::Provider;
 use alloy_rpc_types::{BlockId, BlockNumberOrTag::Latest};
+#[cfg(feature = "base")]
+use base_common_network::Base as BaseNetwork;
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
 use eyre::{Result, WrapErr};
@@ -200,6 +205,11 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
         CastSubcommand::ToBytes32 { bytes } => {
             let value = stdin::unwrap_line(bytes)?;
             let out = SimpleCast::to_bytes32(&value)?;
+            print_scalar(out)?;
+        }
+        CastSubcommand::ToBytesMemory { data } => {
+            let value = stdin::unwrap_line(data)?;
+            let out = SimpleCast::to_bytes_memory(&value)?;
             print_scalar(out)?;
         }
         CastSubcommand::Pad { data, right, left: _, len } => {
@@ -414,7 +424,25 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
             // Can use either --raw or specify raw as a field
             let is_raw_block = raw || fields.contains(&"raw".into());
             let output = if is_raw_block {
+                // Base encodes EIP-8130 transactions, so the raw block is only faithful with a
+                // Base-typed provider. Base is the only family inferred here; every other one
+                // still comes from `--network` alone.
+                #[cfg(feature = "base")]
+                let network = match network {
+                    Some(network) => Some(network),
+                    None => {
+                        resolve_network(&config).await?.is_base().then_some(NetworkVariant::Base)
+                    }
+                };
                 match network {
+                    #[cfg(feature = "base")]
+                    Some(NetworkVariant::Base) => {
+                        let provider =
+                            ProviderBuilder::<BaseNetwork>::from_config(&config)?.build()?;
+                        Cast::new(&provider)
+                            .block_raw(block.unwrap_or(BlockId::Number(Latest)), full)
+                            .await?
+                    }
                     #[cfg(feature = "optimism")]
                     Some(NetworkVariant::Optimism) => {
                         let provider =
@@ -722,28 +750,89 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
             let config = rpc.load_config()?;
             // Can use either --raw or specify raw as a field
             let is_raw = raw || field.as_ref().is_some_and(|f| f == "raw");
-            let output = match network {
-                #[cfg(feature = "optimism")]
-                Some(NetworkVariant::Optimism) => {
-                    let provider = ProviderBuilder::<Optimism>::from_config(&config)?.build()?;
+            // Base encodes EIP-8130 transactions, so the response is only faithful with a
+            // Base-typed provider. Base is the only family inferred here; every other one still
+            // comes from `--network` alone.
+            #[cfg(feature = "base")]
+            let network = match network {
+                Some(network) => Some(network),
+                None => resolve_network(&config).await?.is_base().then_some(NetworkVariant::Base),
+            };
+            let output = if is_raw || lane {
+                let encoded = match network {
+                    #[cfg(feature = "base")]
+                    Some(NetworkVariant::Base) => {
+                        let provider =
+                            ProviderBuilder::<BaseNetwork>::from_config(&config)?.build()?;
+                        let tx =
+                            Cast::new(&provider).transaction_response(tx_hash, from, nonce).await?;
+                        tx.as_ref().encoded_2718().into()
+                    }
+                    #[cfg(feature = "optimism")]
+                    Some(NetworkVariant::Optimism) => {
+                        let provider =
+                            ProviderBuilder::<Optimism>::from_config(&config)?.build()?;
+                        let tx =
+                            Cast::new(&provider).transaction_response(tx_hash, from, nonce).await?;
+                        tx.as_ref().encoded_2718().into()
+                    }
+                    Some(NetworkVariant::Tempo) => {
+                        let provider =
+                            ProviderBuilder::<TempoNetwork>::from_config(&config)?.build()?;
+                        let tx =
+                            Cast::new(&provider).transaction_response(tx_hash, from, nonce).await?;
+                        tx.as_ref().encoded_2718().into()
+                    }
+                    _ => {
+                        let provider = utils::get_provider(&config)?;
+                        let tx =
+                            Cast::new(&provider).transaction_response(tx_hash, from, nonce).await?;
+                        FoundryTxEnvelope::encode_rpc_2718(&tx).wrap_err_with(|| {
+                            format!("Cannot EIP-2718 encode transaction type 0x{:x}", tx.ty())
+                        })?
+                    }
+                };
 
-                    Cast::new(&provider)
-                        .transaction(tx_hash, from, nonce, field, is_raw, to_request, lane)
-                        .await?
+                if lane {
+                    FoundryTxEnvelope::decode_2718(&mut encoded.as_ref())
+                        .wrap_err("failed to decode transaction for lane classification")?;
+                    format_lane_classification(&classify_payment_lane(&encoded))?
+                } else {
+                    format!("0x{}", hex::encode(encoded))
                 }
-                Some(NetworkVariant::Tempo) => {
-                    let provider =
-                        ProviderBuilder::<TempoNetwork>::from_config(&config)?.build()?;
-                    Cast::new(&provider)
-                        .transaction(tx_hash, from, nonce, field, is_raw, to_request, lane)
-                        .await?
-                }
-                // Ethereum (default) or no --raw flag
-                _ => {
-                    let provider = utils::get_provider(&config)?;
-                    Cast::new(&provider)
-                        .transaction(tx_hash, from, nonce, field, is_raw, to_request, lane)
-                        .await?
+            } else {
+                match network {
+                    #[cfg(feature = "base")]
+                    Some(NetworkVariant::Base) => {
+                        let provider =
+                            ProviderBuilder::<BaseNetwork>::from_config(&config)?.build()?;
+                        Cast::new(&provider)
+                            .transaction(tx_hash, from, nonce, field, false, to_request, false)
+                            .await?
+                    }
+                    #[cfg(feature = "optimism")]
+                    Some(NetworkVariant::Optimism) => {
+                        let provider =
+                            ProviderBuilder::<Optimism>::from_config(&config)?.build()?;
+
+                        Cast::new(&provider)
+                            .transaction(tx_hash, from, nonce, field, false, to_request, false)
+                            .await?
+                    }
+                    Some(NetworkVariant::Tempo) => {
+                        let provider =
+                            ProviderBuilder::<TempoNetwork>::from_config(&config)?.build()?;
+                        Cast::new(&provider)
+                            .transaction(tx_hash, from, nonce, field, false, to_request, false)
+                            .await?
+                    }
+                    // Ethereum (default), Monad, or no --raw flag
+                    _ => {
+                        let provider = utils::get_provider(&config)?;
+                        Cast::new(&provider)
+                            .transaction(tx_hash, from, nonce, field, false, to_request, false)
+                            .await?
+                    }
                 }
             };
             print_json_value_or_scalar(output)?;
@@ -935,16 +1024,22 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
             }
         }
         CastSubcommand::Create2(cmd) => {
-            cmd.run()?;
+            cmd.execute()?;
         }
         CastSubcommand::Wallet { command } => command.run().await?,
+        CastSubcommand::Safe { command } => command.run().await?,
         CastSubcommand::Completions { shell } => {
             generate(shell, &mut CastArgs::command(), "cast", &mut std::io::stdout())
         }
         CastSubcommand::Logs(cmd) => cmd.run().await?,
+        CastSubcommand::Events(cmd) => cmd.run().await?,
         CastSubcommand::DecodeTransaction { tx, network } => {
             let tx = stdin::unwrap_line(tx)?;
             let decoded_tx = match network {
+                #[cfg(feature = "base")]
+                Some(NetworkVariant::Base) => {
+                    SimpleCast::decode_raw_transaction::<BaseNetwork>(&tx)?
+                }
                 #[cfg(feature = "optimism")]
                 Some(NetworkVariant::Optimism) => {
                     SimpleCast::decode_raw_transaction::<Optimism>(&tx)?
@@ -955,6 +1050,8 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
                 Some(NetworkVariant::Ethereum) => {
                     SimpleCast::decode_raw_transaction::<Ethereum>(&tx)?
                 }
+                #[cfg(feature = "monad")]
+                Some(NetworkVariant::Monad) => SimpleCast::decode_raw_transaction::<Ethereum>(&tx)?,
                 // Without an explicit `--network` override, decode with the Foundry envelope,
                 // which dispatches on the EIP-2718 type byte for the transaction types compiled
                 // into `FoundryNetwork`, including Tempo txs (`0x76`).
@@ -969,6 +1066,7 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
         }
         CastSubcommand::TxPool { command } => command.run().await?,
         CastSubcommand::Erc20Token { command } => command.run().await?,
+        CastSubcommand::Erc4626 { command } => command.run().await?,
         CastSubcommand::Tip20Token { command } => command.run().await?,
         CastSubcommand::ReceivePolicy { command } => command.run().await?,
         CastSubcommand::Tip403 { command } => command.run().await?,
@@ -977,7 +1075,7 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
         CastSubcommand::KeyAuthorization { command } => command.run().await?,
         CastSubcommand::Tempo { command } => command.run().await?,
         CastSubcommand::VirtualAddress { command } => command.run().await?,
-        #[cfg(feature = "optimism")]
+        #[cfg(any(feature = "base", feature = "optimism"))]
         CastSubcommand::DAEstimate(cmd) => {
             cmd.run().await?;
         }
