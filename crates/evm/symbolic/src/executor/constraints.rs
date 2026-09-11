@@ -1,4 +1,5 @@
 use super::*;
+use foundry_evm::revm::interpreter::instructions::i256::i256_cmp;
 
 impl SymbolicExecutor {
     pub(super) fn handle_assume(
@@ -31,7 +32,7 @@ impl SymbolicExecutor {
             Some(false) => Ok(CheatcodeOutcome::AssumeRejected),
             None => {
                 state.constraints.push(condition);
-                if self.solver.is_sat(&mut self.cx, &state.constraints)? {
+                if self.is_sat_with_state(state, &state.constraints)? {
                     Ok(CheatcodeOutcome::Continue(Vec::new()))
                 } else {
                     Ok(CheatcodeOutcome::AssumeRejected)
@@ -54,7 +55,7 @@ impl SymbolicExecutor {
             expr,
             U256::from(max),
         ));
-        if self.solver.is_sat(&mut self.cx, &above_max)? {
+        if self.is_sat_with_state(state, &above_max)? {
             return Err(SymbolicError::Unsupported(reason));
         }
 
@@ -69,7 +70,7 @@ impl SymbolicExecutor {
                 expr,
                 U256::from(mid),
             ));
-            if self.solver.is_sat(&mut self.cx, &above_mid)? {
+            if self.is_sat_with_state(state, &above_mid)? {
                 low = mid + 1;
             } else {
                 high = mid;
@@ -91,7 +92,7 @@ impl SymbolicExecutor {
             None => {
                 let mut constraints = state.constraints.clone();
                 constraints.push(condition);
-                if self.solver.is_sat(&mut self.cx, &constraints)? {
+                if self.is_sat_with_state(state, &constraints)? {
                     state.constraints = constraints;
                     Ok(true)
                 } else {
@@ -151,9 +152,10 @@ impl SymbolicExecutor {
             return Ok(CheatcodeOutcome::Failure);
         }
         let out_of_range = in_range.not(&mut self.cx);
-        let (_out_of_range_constraints, out_of_range_sat) =
+        let (out_of_range_constraints, out_of_range_sat) =
             self.constraints_with_condition(state, out_of_range)?;
         if out_of_range_sat {
+            state.constraints = out_of_range_constraints;
             return Ok(CheatcodeOutcome::Failure);
         }
 
@@ -181,7 +183,10 @@ impl SymbolicExecutor {
         if let (Some(value), Some(min), Some(max)) =
             (value.as_const(), min.as_const(), max.as_const())
         {
-            if !slt(min, max) || slt(value, min) || slt(max, value) {
+            if !i256_cmp(&min, &max).is_lt()
+                || i256_cmp(&value, &min).is_lt()
+                || i256_cmp(&value, &max).is_gt()
+            {
                 return Ok(CheatcodeOutcome::Failure);
             }
             let bounded = if value == min { max } else { min };
@@ -189,7 +194,7 @@ impl SymbolicExecutor {
         }
 
         if let (Some(min), Some(max)) = (min.as_const(), max.as_const())
-            && !slt(min, max)
+            && !i256_cmp(&min, &max).is_lt()
         {
             return Ok(CheatcodeOutcome::Failure);
         }
@@ -213,9 +218,10 @@ impl SymbolicExecutor {
             return Ok(CheatcodeOutcome::Failure);
         }
         let out_of_range = in_range.not(&mut self.cx);
-        let (_out_of_range_constraints, out_of_range_sat) =
+        let (out_of_range_constraints, out_of_range_sat) =
             self.constraints_with_condition(state, out_of_range)?;
         if out_of_range_sat {
+            state.constraints = out_of_range_constraints;
             return Ok(CheatcodeOutcome::Failure);
         }
 

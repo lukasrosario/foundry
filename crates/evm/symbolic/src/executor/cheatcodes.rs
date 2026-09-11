@@ -1,4 +1,5 @@
 use foundry_cheatcodes_spec::Vm::*;
+use foundry_evm::inspectors::cheatcodes::current_execution_context;
 
 use super::*;
 
@@ -17,7 +18,7 @@ impl SymbolicExecutor {
 
         let mut fail_constraints = state.constraints.clone();
         fail_constraints.push(fail);
-        if self.solver.is_sat(&mut self.cx, &fail_constraints)? {
+        if self.is_sat_with_state(state, &fail_constraints)? {
             state.constraints = fail_constraints;
             return Ok(CheatcodeOutcome::Failure);
         }
@@ -33,19 +34,41 @@ impl SymbolicExecutor {
         reverter: Option<SymExpr>,
         remaining: u64,
     ) -> CheatcodeOutcome {
+        if state.expected_revert.is_some() {
+            return CheatcodeOutcome::Revert(error_string_return_data(
+                &mut self.cx,
+                "you must call another function prior to expecting a second revert",
+            ));
+        }
         state.expected_revert = Some(ExpectedRevert::new(data, reverter, remaining));
         CheatcodeOutcome::Continue(Vec::new())
     }
 
-    pub(super) fn set_expected_emit(
+    fn expect_emit_from_args(
         &mut self,
         state: &mut PathState,
+        args_offset: usize,
         checks: ExpectedEmitChecks,
-        emitter: Option<SymExpr>,
-        remaining: u64,
-    ) -> CheatcodeOutcome {
+        emitter_arg: Option<usize>,
+        count_arg: Option<usize>,
+    ) -> Result<CheatcodeOutcome, SymbolicError> {
+        let emitter = emitter_arg
+            .map(|index| read_abi_word_arg(&mut self.cx, &state.memory, args_offset, index))
+            .transpose()?;
+        let remaining = count_arg
+            .map(|index| {
+                read_abi_u64_arg(
+                    &mut self.cx,
+                    &state.memory,
+                    args_offset,
+                    index,
+                    "symbolic vm.expectEmit",
+                )
+            })
+            .transpose()?
+            .unwrap_or(1);
         state.expected_emit = Some(ExpectedEmit::new(checks, emitter, remaining));
-        CheatcodeOutcome::Continue(Vec::new())
+        Ok(CheatcodeOutcome::Continue(Vec::new()))
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -59,8 +82,13 @@ impl SymbolicExecutor {
         data: SymBytes,
         count: Option<u64>,
     ) -> CheatcodeOutcome {
-        state.expected_calls.push(ExpectedCall::new(callee, value, gas, min_gas, data, count));
-        CheatcodeOutcome::Continue(Vec::new())
+        let expected = ExpectedCall::new(callee, value, gas, min_gas, data, count);
+        match register_expected_call(&mut state.expected_calls, &mut self.cx, expected) {
+            Ok(()) => CheatcodeOutcome::Continue(Vec::new()),
+            Err(message) => {
+                CheatcodeOutcome::Revert(error_string_return_data(&mut self.cx, message))
+            }
+        }
     }
 
     pub(super) fn set_expected_create(
@@ -146,6 +174,7 @@ impl SymbolicExecutor {
             return Ok(StepOutcome::Revert);
         }
 
+        self.stateless_retry_safe = false;
         let mut initcode = artifact_code(&artifact, false)?;
         initcode.extend_from_slice(&constructor_args);
         let initcode = SymCode::concrete(&mut self.cx, initcode);
@@ -167,16 +196,8 @@ impl SymbolicExecutor {
         let zero = SymExpr::zero(&mut self.cx);
         let calldata = SymBytes::empty(&mut self.cx);
         let calldata = SymCalldata::from_bytes(&mut self.cx, calldata);
-        let mut frame = CallFrame::new(
-            &mut self.cx,
-            created,
-            created,
-            created,
-            state.address,
-            zero,
-            false,
-            calldata,
-        );
+        let mut frame =
+            CallFrame::new(&mut self.cx, created, created, state.address, zero, false, calldata);
         frame.address_word = created_word.clone();
         frame.caller_word = state.address_word.clone();
         let mut child = state.child(frame);
@@ -184,96 +205,55 @@ impl SymbolicExecutor {
         child.world = failure_world.clone();
         child.world.mark_current_transaction_created(created);
         child.world.set_nonce(created, 1);
-        child.expected_revert = None;
-        child.assume_no_revert_next_call = None;
 
         let outcomes = self.execute_external_call(executor, child, &initcode, completed_paths)?;
-        let Some((first, rest)) = outcomes.split_first() else {
+        if outcomes.is_empty() {
             return Ok(StepOutcome::AssumeRejected);
-        };
+        }
 
         let mut parents = VecDeque::with_capacity(outcomes.len());
-        for outcome in std::iter::once(first).chain(rest.iter()) {
-            let mut parent = state.clone();
-            parent.constraints = outcome.state.constraints.clone();
-            parent.next_symbol = outcome.state.next_symbol;
-            parent.inherit_branch_target_progress(&outcome.state);
-
-            if let Some(assumption) = parent.assume_no_revert_next_call.take()
-                && matches!(outcome.status, TopLevelCallStatus::Revert)
-                && self.assume_no_revert_rejects(
-                    &mut parent,
-                    &assumption,
-                    created,
-                    &outcome.return_data,
-                )?
-            {
-                continue;
-            }
-
-            if let Some(mut expected) = parent.expected_revert.clone() {
-                match outcome.status {
-                    TopLevelCallStatus::Success => {
-                        *state = parent;
-                        return Ok(StepOutcome::Failure);
-                    }
-                    TopLevelCallStatus::Revert | TopLevelCallStatus::Failure => {
-                        if !self.expected_revert_matches(
-                            &mut parent,
-                            &expected,
-                            created,
-                            &outcome.return_data,
-                        )? {
-                            *state = parent;
-                            return Ok(StepOutcome::Failure);
-                        }
-                        if expected.consume_one() {
-                            parent.expected_revert = None;
-                        } else {
-                            parent.expected_revert = Some(expected);
-                        }
-                        parent.access_record = outcome.state.access_record.clone();
-                        parent.expected_calls = outcome.state.expected_calls.clone();
-                        parent.expected_creates = pending_expected_creates.clone();
-                        parent.call_mocks = outcome.state.call_mocks.clone();
-                        parent.function_mocks = outcome.state.function_mocks.clone();
-                        parent.world = failure_world.clone();
-                        let zero = SymExpr::zero(&mut self.cx);
-                        let return_data = SymReturnData::from_words(&mut self.cx, vec![zero]);
-                        complete_cheatcode_call(
-                            &mut self.cx,
-                            &mut parent,
-                            out_offset.clone(),
-                            out_size,
-                            return_data,
-                        )?;
-                        parents.push_back(parent);
-                        continue;
-                    }
+        for outcome in outcomes {
+            match self.join_call_outcome(state, outcome, created)? {
+                JoinedCallOutcome::Rejected => {}
+                JoinedCallOutcome::Failure(parent) => {
+                    *state = parent;
+                    return Ok(StepOutcome::Failure);
                 }
-            }
-
-            match outcome.status {
-                TopLevelCallStatus::Success => {
-                    parent.world = outcome.state.world.clone();
-                    parent.block = outcome.state.block.clone();
-                    parent.recorded_logs = outcome.state.recorded_logs.clone();
-                    parent.access_record = outcome.state.access_record.clone();
-                    parent.expected_emit = outcome.state.expected_emit.clone();
-                    parent.expected_calls = outcome.state.expected_calls.clone();
+                JoinedCallOutcome::ExpectedRevert { mut parent, child } => {
+                    parent.expected_calls = child.expected_calls;
                     parent.expected_creates = pending_expected_creates.clone();
-                    parent.call_mocks = outcome.state.call_mocks.clone();
-                    parent.function_mocks = outcome.state.function_mocks.clone();
+                    parent.call_mocks = child.call_mocks;
+                    parent.function_mocks = child.function_mocks;
+                    parent.world = failure_world.clone();
+                    let zero = SymExpr::zero(&mut self.cx);
+                    let return_data = SymReturnData::from_words(&mut self.cx, vec![zero]);
+                    complete_cheatcode_call(
+                        &mut self.cx,
+                        &mut parent,
+                        out_offset.clone(),
+                        out_size,
+                        return_data,
+                    )?;
+                    parents.push_back(parent);
+                }
+                JoinedCallOutcome::Success { mut parent, child } => {
+                    parent.world = child.world;
+                    parent.block = child.block;
+                    parent.expected_emit = child.expected_emit;
+                    parent.expected_calls = child.expected_calls;
+                    parent.expected_creates = pending_expected_creates.clone();
+                    parent.call_mocks = child.call_mocks;
+                    parent.function_mocks = child.function_mocks;
                     self.observe_expected_create(
                         &mut parent,
                         state.address,
                         CreateKind::Create,
-                        &outcome.return_data,
+                        &child.frame.return_data,
                     )?;
                     if !parent.world.is_destroyed(created) {
                         parent
                             .world
-                            .install_code(created, outcome.return_data.to_code(&mut self.cx)?);
+                            .install_code(created, child.frame.return_data.to_code(&mut self.cx)?);
                         parent.world.set_nonce(created, 1);
                     }
                     let return_data =
@@ -285,28 +265,19 @@ impl SymbolicExecutor {
                         out_size,
                         return_data,
                     )?;
+                    parents.push_back(parent);
                 }
-                TopLevelCallStatus::Revert => {
+                JoinedCallOutcome::Revert { mut parent, child } => {
                     parent.world = failure_world.clone();
-                    parent.return_data = outcome.return_data.clone();
+                    parent.return_data = child.frame.return_data;
                     parent.copy_call_output_offset(&mut self.cx, out_offset.clone(), out_size)?;
                     parent.stack.push(SymExpr::zero(&mut self.cx))?;
-                }
-                TopLevelCallStatus::Failure => {
-                    *state = parent;
-                    return Ok(StepOutcome::Failure);
+                    parents.push_back(parent);
                 }
             }
-
-            parents.push_back(parent);
         }
 
-        let Some(first) = self.pop_next_path(&mut parents) else {
-            return Ok(StepOutcome::AssumeRejected);
-        };
-        *state = first;
-        worklist.extend(parents);
-        Ok(StepOutcome::Continue)
+        Ok(self.resume_parent_paths(state, worklist, parents))
     }
 
     pub(super) fn observe_expected_create(
@@ -467,7 +438,16 @@ impl SymbolicExecutor {
         returns: Vec<SymReturnData>,
         reverts: bool,
     ) -> CheatcodeOutcome {
-        state.call_mocks.push(CallMock::new(callee, value, data, returns, reverts));
+        // Replace identical definitions in place to preserve mock precedence.
+        if let Some(existing) = state.call_mocks.iter_mut().find(|mock| {
+            mock.callee == callee
+                && mock.value() == value
+                && mock.data.same_bytes(&mut self.cx, &data)
+        }) {
+            *existing = CallMock::new(callee, value, data, returns, reverts);
+        } else {
+            state.call_mocks.push(CallMock::new(callee, value, data, returns, reverts));
+        }
         CheatcodeOutcome::Continue(Vec::new())
     }
 
@@ -577,6 +557,76 @@ impl SymbolicExecutor {
                 return Ok(CheatcodeOutcome::ContinueData(
                     self.accesses_return_data_for_target(state, target)?,
                 ));
+            }
+            registerSloadHookCall::SELECTOR | registerSstoreHookCall::SELECTOR => {
+                let target = read_abi_address_arg(
+                    &mut self.cx,
+                    &state.memory,
+                    args_offset,
+                    0,
+                    "symbolic storage hook target",
+                )?;
+                let callback: [u8; 4] = state
+                    .memory
+                    .read_concrete(&mut self.cx, args_offset + 32, 4)?
+                    .try_into()
+                    .map_err(|_| SymbolicError::Unsupported("symbolic storage hook callback"))?;
+                let hook = SymbolicStorageHook {
+                    callback_target: state.address,
+                    callback_selector: callback,
+                };
+                if selector == registerSloadHookCall::SELECTOR {
+                    state.storage_load_hooks.insert(target, hook);
+                } else {
+                    if state
+                        .mapping_storage_store_hooks
+                        .keys()
+                        .any(|(address, _)| *address == target)
+                    {
+                        return Ok(CheatcodeOutcome::Revert(error_string_return_data(
+                            &mut self.cx,
+                            "cannot register raw SSTORE hook: mapping SSTORE hooks already exist for target",
+                        )));
+                    }
+                    state.storage_store_hooks.insert(target, hook);
+                }
+                return Ok(CheatcodeOutcome::Continue(Vec::new()));
+            }
+            registerMappingSstoreHookCall::SELECTOR => {
+                let target = read_abi_address_arg(
+                    &mut self.cx,
+                    &state.memory,
+                    args_offset,
+                    0,
+                    "symbolic mapping storage hook target",
+                )?;
+                let root = read_abi_concrete_word_arg(
+                    &mut self.cx,
+                    &state.memory,
+                    args_offset,
+                    1,
+                    "symbolic mapping storage hook root",
+                )?;
+                let callback: [u8; 4] = state
+                    .memory
+                    .read_concrete(&mut self.cx, args_offset + 64, 4)?
+                    .try_into()
+                    .map_err(|_| {
+                        SymbolicError::Unsupported("symbolic mapping storage hook callback")
+                    })?;
+                let hook = SymbolicStorageHook {
+                    callback_target: state.address,
+                    callback_selector: callback,
+                };
+                if state.storage_store_hooks.contains_key(&target) {
+                    return Ok(CheatcodeOutcome::Revert(error_string_return_data(
+                        &mut self.cx,
+                        "cannot register mapping SSTORE hook: raw SSTORE hook already exists for target",
+                    )));
+                }
+                state.mapping_hook_keccak_preimages.retain(|(account, _), _| *account != target);
+                state.mapping_storage_store_hooks.insert((target, root), hook);
+                return Ok(CheatcodeOutcome::Continue(Vec::new()));
             }
             getRecordedLogsCall::SELECTOR => {
                 let logs = state.recorded_logs.replace(Vec::new()).unwrap_or_default();
@@ -798,52 +848,40 @@ impl SymbolicExecutor {
                 ));
             }
             expectEmit_2Call::SELECTOR => {
-                return Ok(self.set_expected_emit(
+                return self.expect_emit_from_args(
                     state,
+                    args_offset,
                     ExpectedEmitChecks::default_non_anonymous(),
                     None,
-                    1,
-                ));
+                    None,
+                );
             }
             expectEmit_3Call::SELECTOR => {
-                let emitter = read_abi_word_arg(&mut self.cx, &state.memory, args_offset, 0)?;
-                return Ok(self.set_expected_emit(
+                return self.expect_emit_from_args(
                     state,
+                    args_offset,
                     ExpectedEmitChecks::default_non_anonymous(),
-                    Some(emitter),
-                    1,
-                ));
+                    Some(0),
+                    None,
+                );
             }
             expectEmit_6Call::SELECTOR => {
-                let count = read_abi_u64_arg(
-                    &mut self.cx,
-                    &state.memory,
-                    args_offset,
-                    0,
-                    "symbolic vm.expectEmit",
-                )?;
-                return Ok(self.set_expected_emit(
+                return self.expect_emit_from_args(
                     state,
+                    args_offset,
                     ExpectedEmitChecks::default_non_anonymous(),
                     None,
-                    count,
-                ));
+                    Some(0),
+                );
             }
             expectEmit_7Call::SELECTOR => {
-                let emitter = read_abi_word_arg(&mut self.cx, &state.memory, args_offset, 0)?;
-                let count = read_abi_u64_arg(
-                    &mut self.cx,
-                    &state.memory,
-                    args_offset,
-                    1,
-                    "symbolic vm.expectEmit",
-                )?;
-                return Ok(self.set_expected_emit(
+                return self.expect_emit_from_args(
                     state,
+                    args_offset,
                     ExpectedEmitChecks::default_non_anonymous(),
-                    Some(emitter),
-                    count,
-                ));
+                    Some(0),
+                    Some(1),
+                );
             }
             expectEmit_0Call::SELECTOR => {
                 let checks = ExpectedEmitChecks::from_non_anonymous_args(
@@ -851,7 +889,7 @@ impl SymbolicExecutor {
                     &state.memory,
                     args_offset,
                 )?;
-                return Ok(self.set_expected_emit(state, checks, None, 1));
+                return self.expect_emit_from_args(state, args_offset, checks, None, None);
             }
             expectEmit_1Call::SELECTOR => {
                 let checks = ExpectedEmitChecks::from_non_anonymous_args(
@@ -859,8 +897,7 @@ impl SymbolicExecutor {
                     &state.memory,
                     args_offset,
                 )?;
-                let emitter = read_abi_word_arg(&mut self.cx, &state.memory, args_offset, 4)?;
-                return Ok(self.set_expected_emit(state, checks, Some(emitter), 1));
+                return self.expect_emit_from_args(state, args_offset, checks, Some(4), None);
             }
             expectEmit_4Call::SELECTOR => {
                 let checks = ExpectedEmitChecks::from_non_anonymous_args(
@@ -868,14 +905,7 @@ impl SymbolicExecutor {
                     &state.memory,
                     args_offset,
                 )?;
-                let count = read_abi_u64_arg(
-                    &mut self.cx,
-                    &state.memory,
-                    args_offset,
-                    4,
-                    "symbolic vm.expectEmit",
-                )?;
-                return Ok(self.set_expected_emit(state, checks, None, count));
+                return self.expect_emit_from_args(state, args_offset, checks, None, Some(4));
             }
             expectEmit_5Call::SELECTOR => {
                 let checks = ExpectedEmitChecks::from_non_anonymous_args(
@@ -883,32 +913,25 @@ impl SymbolicExecutor {
                     &state.memory,
                     args_offset,
                 )?;
-                let emitter = read_abi_word_arg(&mut self.cx, &state.memory, args_offset, 4)?;
-                let count = read_abi_u64_arg(
-                    &mut self.cx,
-                    &state.memory,
-                    args_offset,
-                    5,
-                    "symbolic vm.expectEmit",
-                )?;
-                return Ok(self.set_expected_emit(state, checks, Some(emitter), count));
+                return self.expect_emit_from_args(state, args_offset, checks, Some(4), Some(5));
             }
             expectEmitAnonymous_2Call::SELECTOR => {
-                return Ok(self.set_expected_emit(
+                return self.expect_emit_from_args(
                     state,
+                    args_offset,
                     ExpectedEmitChecks::default_anonymous(),
                     None,
-                    1,
-                ));
+                    None,
+                );
             }
             expectEmitAnonymous_3Call::SELECTOR => {
-                let emitter = read_abi_word_arg(&mut self.cx, &state.memory, args_offset, 0)?;
-                return Ok(self.set_expected_emit(
+                return self.expect_emit_from_args(
                     state,
+                    args_offset,
                     ExpectedEmitChecks::default_anonymous(),
-                    Some(emitter),
-                    1,
-                ));
+                    Some(0),
+                    None,
+                );
             }
             expectEmitAnonymous_0Call::SELECTOR => {
                 let checks = ExpectedEmitChecks::from_anonymous_args(
@@ -916,7 +939,7 @@ impl SymbolicExecutor {
                     &state.memory,
                     args_offset,
                 )?;
-                return Ok(self.set_expected_emit(state, checks, None, 1));
+                return self.expect_emit_from_args(state, args_offset, checks, None, None);
             }
             expectEmitAnonymous_1Call::SELECTOR => {
                 let checks = ExpectedEmitChecks::from_anonymous_args(
@@ -924,8 +947,7 @@ impl SymbolicExecutor {
                     &state.memory,
                     args_offset,
                 )?;
-                let emitter = read_abi_word_arg(&mut self.cx, &state.memory, args_offset, 5)?;
-                return Ok(self.set_expected_emit(state, checks, Some(emitter), 1));
+                return self.expect_emit_from_args(state, args_offset, checks, Some(5), None);
             }
             expectCall_0Call::SELECTOR => {
                 let callee = read_abi_word_arg(&mut self.cx, &state.memory, args_offset, 0)?;
@@ -1910,6 +1932,7 @@ impl SymbolicExecutor {
                     0,
                     "symbolic vm.getCode",
                 )?;
+                self.stateless_retry_safe = false;
                 let code = artifact_code(&artifact, selector == getDeployedCodeCall::SELECTOR)?;
                 return Ok(CheatcodeOutcome::ContinueData(abi_concrete_bytes_return(
                     &mut self.cx,
@@ -2338,6 +2361,7 @@ impl SymbolicExecutor {
                 )));
             }
             projectRootCall::SELECTOR => {
+                self.stateless_retry_safe = false;
                 let root = std::env::current_dir()
                     .map_err(|_| SymbolicError::Unsupported("symbolic vm.projectRoot"))?;
                 return Ok(CheatcodeOutcome::ContinueData(abi_concrete_bytes_return(
@@ -2346,6 +2370,7 @@ impl SymbolicExecutor {
                 )));
             }
             unixTimeCall::SELECTOR => {
+                self.stateless_retry_safe = false;
                 let milliseconds = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_err(|_| SymbolicError::Unsupported("symbolic vm.unixTime"))?
@@ -2372,9 +2397,13 @@ impl SymbolicExecutor {
                     0,
                     "symbolic vm.isContext",
                 )?;
+                let context = u8::try_from(context)
+                    .ok()
+                    .and_then(|context| ForgeContext::try_from(context).ok())
+                    .ok_or(SymbolicError::Unsupported("symbolic vm.isContext invalid context"))?;
                 return Ok(CheatcodeOutcome::Continue(vec![SymExpr::constant(
                     &mut self.cx,
-                    U256::from(context == U256::ZERO || context == U256::from(1)),
+                    U256::from(current_execution_context() == Some(context)),
                 )]));
             }
             toString_0Call::SELECTOR => {
@@ -2659,6 +2688,7 @@ impl SymbolicExecutor {
                     0,
                     "symbolic vm.envExists",
                 )?;
+                self.stateless_retry_safe = false;
                 return Ok(CheatcodeOutcome::Continue(vec![SymExpr::constant(
                     &mut self.cx,
                     U256::from(std::env::var_os(name).is_some()),
@@ -2672,6 +2702,7 @@ impl SymbolicExecutor {
                     0,
                     "symbolic vm.envBool",
                 )?;
+                self.stateless_retry_safe = false;
                 let value = std::env::var(name)
                     .map_err(|_| SymbolicError::Unsupported("symbolic env var missing"))?;
                 return Ok(CheatcodeOutcome::Continue(vec![SymExpr::constant(
@@ -2687,6 +2718,7 @@ impl SymbolicExecutor {
                     0,
                     "symbolic vm.envUint",
                 )?;
+                self.stateless_retry_safe = false;
                 let value = std::env::var(name)
                     .map_err(|_| SymbolicError::Unsupported("symbolic env var missing"))?;
                 return Ok(CheatcodeOutcome::Continue(vec![SymExpr::constant(
@@ -2702,6 +2734,7 @@ impl SymbolicExecutor {
                     0,
                     "symbolic vm.envInt",
                 )?;
+                self.stateless_retry_safe = false;
                 let value = std::env::var(name)
                     .map_err(|_| SymbolicError::Unsupported("symbolic env var missing"))?;
                 return Ok(CheatcodeOutcome::Continue(vec![SymExpr::constant(
@@ -2717,6 +2750,7 @@ impl SymbolicExecutor {
                     0,
                     "symbolic vm.envAddress",
                 )?;
+                self.stateless_retry_safe = false;
                 let value = std::env::var(name)
                     .map_err(|_| SymbolicError::Unsupported("symbolic env var missing"))?;
                 let address = parse_env_address(&value)?;
@@ -2733,6 +2767,7 @@ impl SymbolicExecutor {
                     0,
                     "symbolic vm.envBytes32",
                 )?;
+                self.stateless_retry_safe = false;
                 let value = std::env::var(name)
                     .map_err(|_| SymbolicError::Unsupported("symbolic env var missing"))?;
                 return Ok(CheatcodeOutcome::Continue(vec![SymExpr::constant(
@@ -2748,6 +2783,7 @@ impl SymbolicExecutor {
                     0,
                     "symbolic vm.envString",
                 )?;
+                self.stateless_retry_safe = false;
                 let value = std::env::var(name)
                     .map_err(|_| SymbolicError::Unsupported("symbolic env var missing"))?;
                 return Ok(CheatcodeOutcome::ContinueData(abi_concrete_bytes_return(
@@ -2763,6 +2799,7 @@ impl SymbolicExecutor {
                     0,
                     "symbolic vm.envBytes",
                 )?;
+                self.stateless_retry_safe = false;
                 let value = std::env::var(name)
                     .map_err(|_| SymbolicError::Unsupported("symbolic env var missing"))?;
                 let bytes = parse_env_bytes(&value)?;
@@ -2787,6 +2824,7 @@ impl SymbolicExecutor {
                 )?;
                 let name = dyn_string(&values[0])?;
                 let delimiter = dyn_string(&values[1])?;
+                self.stateless_retry_safe = false;
                 let value = std::env::var(name)
                     .map_err(|_| SymbolicError::Unsupported("symbolic env var missing"))?;
                 let value = if selector == envBool_1Call::SELECTOR {
@@ -2817,6 +2855,7 @@ impl SymbolicExecutor {
                     0,
                     "symbolic vm.envOr",
                 )?;
+                self.stateless_retry_safe = false;
                 let value = match std::env::var(name) {
                     Ok(value) => U256::from(parse_env_bool(&value)?),
                     Err(_) => read_abi_concrete_word_arg(
@@ -2850,6 +2889,7 @@ impl SymbolicExecutor {
                     1,
                     "symbolic vm.envOr",
                 )?;
+                self.stateless_retry_safe = false;
                 let value = match std::env::var(name) {
                     Ok(value) if selector == envOr_1Call::SELECTOR => parse_env_uint(&value)?,
                     Ok(value) if selector == envOr_2Call::SELECTOR => parse_env_int(&value)?,
@@ -2873,6 +2913,7 @@ impl SymbolicExecutor {
                     vec![DynSolType::String, DynSolType::String],
                 )?;
                 let name = dyn_string(&values[0])?;
+                self.stateless_retry_safe = false;
                 let value = std::env::var(name).unwrap_or(dyn_string(&values[1])?);
                 return Ok(CheatcodeOutcome::ContinueData(abi_concrete_bytes_return(
                     &mut self.cx,
@@ -2888,6 +2929,7 @@ impl SymbolicExecutor {
                     vec![DynSolType::String, DynSolType::Bytes],
                 )?;
                 let name = dyn_string(&values[0])?;
+                self.stateless_retry_safe = false;
                 let value = match std::env::var(name) {
                     Ok(value) => parse_env_bytes(&value)?,
                     Err(_) => dyn_bytes(&values[1])?,
@@ -2932,6 +2974,7 @@ impl SymbolicExecutor {
                 )?;
                 let name = dyn_string(&values[0])?;
                 let delimiter = dyn_string(&values[1])?;
+                self.stateless_retry_safe = false;
                 let value = match std::env::var(name) {
                     Ok(value) if selector == envOr_7Call::SELECTOR => {
                         parse_env_array(&value, &delimiter, parse_env_bool_value)?
@@ -2974,6 +3017,7 @@ impl SymbolicExecutor {
                 if args.is_empty() || args[0].is_empty() {
                     return Err(SymbolicError::Unsupported("symbolic ffi empty command"));
                 }
+                self.stateless_retry_safe = false;
                 let output = Command::new(&args[0])
                     .args(&args[1..])
                     .output()
